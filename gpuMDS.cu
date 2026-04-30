@@ -1,18 +1,11 @@
-// gpuMDS-v4.1.cu
-// Modified from gpuMDS-v4.cu:
-// - Spatial hash grid built from (x,y) coordinates before Borůvka loop
-// - First Borůvka iteration uses KNN candidates from hash grid (k = log2(n))
-// - Cell size auto-computed from average point spacing
-// - v4.1: Spiral search KNN with early exit replaces fixed-radius square scan
-// - Hash grid freed post-loop only if GPU memory headroom is insufficient
-//
-// Part 1 = Borůvka's MST (CUDA GPU, on-the-fly Euclidean distances)
-//          v3.1: merge + CSR construction fully on GPU
-//          v4:   spatial hash grid KNN acceleration for first Borůvka iterations
-//          v4.1: spiral search with early termination
-// Part 2 = CUDA parallel 1k route search (one thread per iteration) with memory coalescing
-// Part 3 = seqMDS 2-opt post-processing (CPU)
-//
+// gpuMDS.cu
+// GPU-accelerated CVRP Solver using three-phase approach:
+//   Part 1: Borůvka's MST on GPU (on-the-fly Euclidean distances)
+//           - Spatial hash grid KNN acceleration for first Borůvka iteration
+//           - Spiral search with early termination for KNN lookup
+//           - Merge and CSR construction fully on GPU
+//   Part 2: CUDA parallel 1k route search (one thread per iteration, memory coalesced)
+//   Part 3: Sequential 2-opt post-processing on CPU
 
 #include <iostream>
 #include <fstream>
@@ -39,13 +32,12 @@
 #include <thrust/sequence.h>
 #include <thrust/scan.h>
 #include <thrust/functional.h>
-// MODIFIED: v4 — additional Thrust headers for hash grid
 #include <thrust/sort.h>
 #include <thrust/transform_reduce.h>
 #include <thrust/reduce.h>
 #include <thrust/count.h>
 
-// MODIFIED: v4.1 — Compile-time max k for register-resident arrays in spiral search
+// Compile-time max k for register-resident arrays in spiral search
 #define MAX_K 64
 
 // -----------------------------------------------------------------------
@@ -62,7 +54,7 @@
   } while (0)
 
 // -----------------------------------------------------------------------
-// Types (same as seqMDS)
+// Types
 // -----------------------------------------------------------------------
 using point_t  = double;
 using weight_t = double;
@@ -73,7 +65,7 @@ using node_t   = int;
 bool g_verbose = false;
 
 // -----------------------------------------------------------------------
-// Edge class (same as seqMDS)
+// Edge class
 // -----------------------------------------------------------------------
 class Edge {
  public:
@@ -94,7 +86,7 @@ class Point {
 };
 
 // -----------------------------------------------------------------------
-// VRP class — identical to seqMDS (with precomputed dist table)
+// VRP class — with precomputed dist table
 // -----------------------------------------------------------------------
 class VRP {
   size_t   size;
@@ -125,7 +117,7 @@ class VRP {
 };
 
 // -----------------------------------------------------------------------
-// VRP::read  (identical to seqMDS)
+// VRP::read
 // -----------------------------------------------------------------------
 unsigned VRP::read(const std::string& filename) {
   std::ifstream in(filename);
@@ -164,8 +156,7 @@ unsigned VRP::read(const std::string& filename) {
 }
 
 // -----------------------------------------------------------------------
-// VRP::cal_graph_dist  (identical to seqMDS — precomputes dist[] table)
-// Not using it anywhere in gpuMDS
+// VRP::cal_graph_dist — precomputes dist[] table (not used by GPU solver)
 // -----------------------------------------------------------------------
 std::vector<std::vector<Edge>> VRP::cal_graph_dist() {
   dist.resize((size * (size - 1)) / 2);
@@ -196,7 +187,8 @@ __device__ inline double gpu_eucl(double x1, double y1, double x2, double y2) {
 }
 
 // -----------------------------------------------------------------------
-// Borůvka Phase Kernel (original full O(n²) scan)
+// Borůvka Phase Kernel — full O(n²) scan
+// Each thread finds the cheapest cross-component edge for one node.
 // -----------------------------------------------------------------------
 __global__ void boruvkaFindCheapest(
     const double* __restrict__ d_x,
@@ -227,7 +219,9 @@ __global__ void boruvkaFindCheapest(
   d_cheapest_w[u]  = best_w;
 }
 
-// MODIFIED: v3.1 — GPU device Union-Find with path splitting + atomicCAS merge
+// -----------------------------------------------------------------------
+// GPU device Union-Find with path splitting + atomicCAS merge
+// -----------------------------------------------------------------------
 __device__ int gpu_find(int* parent, int x) {
     while (parent[x] != x) {
         parent[x] = parent[parent[x]];
@@ -236,7 +230,7 @@ __device__ int gpu_find(int* parent, int x) {
     return x;
 }
 
-// MODIFIED: v3.1 — deterministic index ordering prevents cycle bug
+// Deterministic index ordering prevents cycle bug during concurrent merges
 __device__ bool gpu_unite(int* parent, int* rank_uf, int a, int b) {
     a = gpu_find(parent, a);
     b = gpu_find(parent, b);
@@ -250,7 +244,7 @@ __device__ bool gpu_unite(int* parent, int* rank_uf, int a, int b) {
 }
 
 // -----------------------------------------------------------------------
-// MODIFIED: v3.1 — GPU kernels for Borůvka merge and CSR construction
+// GPU kernels for Borůvka merge and CSR construction
 // -----------------------------------------------------------------------
 __global__ void initUFKernel(int* parent, int* rank_uf, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -259,7 +253,8 @@ __global__ void initUFKernel(int* parent, int* rank_uf, int N) {
     rank_uf[i] = 0;
 }
 
-// MODIFIED: v3.1 — Per-component best-edge reduction using packed atomicMin.
+// Per-component best-edge reduction using packed atomicMin.
+// Packs (float weight, int index) into a single 64-bit value for atomic compare.
 __global__ void findCompBestKernel(
     const int* __restrict__ d_comp,
     const int* __restrict__ d_cheapest_to,
@@ -279,7 +274,7 @@ __global__ void findCompBestKernel(
     atomicMin(&d_comp_best[c], packed);
 }
 
-// MODIFIED: v3.1 — merge kernel only merges the PER-COMPONENT BEST edge.
+// Merge kernel — only merges the per-component best edge to avoid duplicates.
 __global__ void mergeComponentsKernel(
     int* parent, int* rank_uf,
     const int* __restrict__ d_comp,
@@ -355,10 +350,10 @@ __global__ void scatterEdgesKernel(
 }
 
 // -----------------------------------------------------------------------
-// MODIFIED: v4 — Spatial hash grid kernels
+// Spatial hash grid kernels
 // -----------------------------------------------------------------------
 
-// MODIFIED: v4 — Assign each point to a grid cell
+// Assign each point to a grid cell based on its (x, y) coordinate.
 __global__ void assignCellsKernel(
     const double* __restrict__ d_x,
     const double* __restrict__ d_y,
@@ -380,7 +375,7 @@ __global__ void assignCellsKernel(
     d_point_ids[i] = i;
 }
 
-// MODIFIED: v4 — Find start and end index of each cell in the sorted point array
+// Find the start and end index of each cell in the sorted point array.
 __global__ void findCellBoundsKernel(
     const int* __restrict__ d_cell_ids,
     int* d_cell_start,
@@ -399,71 +394,18 @@ __global__ void findCellBoundsKernel(
 }
 
 // -----------------------------------------------------------------------
-// OLD findCheapestEdgeKNN — commented out for reference (v4 original)
+// Spiral Search KNN Kernel
 // -----------------------------------------------------------------------
-#if 0
-__global__ void findCheapestEdgeKNN(
-    const double* __restrict__ d_x,
-    const double* __restrict__ d_y,
-    const int* __restrict__ d_component,
-    const int* __restrict__ d_point_ids,
-    const int* __restrict__ d_cell_start,
-    const int* __restrict__ d_cell_end,
-    int*   d_cheapest_to,
-    double* d_cheapest_w,
-    float x_min, float y_min, float cell_size,
-    int grid_w, int grid_h,
-    float search_radius,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    double best_w = DBL_MAX;
-    int    best_v = -1;
-    int    ci     = d_component[i];
-    double ix     = d_x[i], iy = d_y[i];
-    int cx = (int)(((float)ix - x_min) / cell_size);
-    int cy = (int)(((float)iy - y_min) / cell_size);
-    if (cx < 0) cx = 0; if (cx >= grid_w) cx = grid_w - 1;
-    if (cy < 0) cy = 0; if (cy >= grid_h) cy = grid_h - 1;
-    int r = (int)ceilf(search_radius / cell_size);
-    int cx_lo = cx - r; if (cx_lo < 0) cx_lo = 0;
-    int cx_hi = cx + r; if (cx_hi >= grid_w) cx_hi = grid_w - 1;
-    int cy_lo = cy - r; if (cy_lo < 0) cy_lo = 0;
-    int cy_hi = cy + r; if (cy_hi >= grid_h) cy_hi = grid_h - 1;
-    for (int sy = cy_lo; sy <= cy_hi; ++sy) {
-        for (int sx = cx_lo; sx <= cx_hi; ++sx) {
-            int cell = sy * grid_w + sx;
-            int start = d_cell_start[cell];
-            if (start < 0) continue;
-            int end = d_cell_end[cell];
-            for (int p = start; p <= end; ++p) {
-                int j = d_point_ids[p];
-                if (j == i) continue;
-                if (d_component[j] == ci) continue;
-                double w = gpu_eucl(ix, iy, d_x[j], d_y[j]);
-                if (w < best_w) { best_w = w; best_v = j; }
-            }
-        }
-    }
-    d_cheapest_to[i] = best_v;
-    d_cheapest_w[i]  = (best_v < 0) ? (double)FLT_MAX : best_w;
-}
-#endif
-
-// -----------------------------------------------------------------------
-// MODIFIED: v4.1 — Spiral Search KNN Kernel
-// -----------------------------------------------------------------------
-// Search strategy: Visits hash grid cells ring-by-ring in order of increasing
-//   Chebyshev distance from the query cell (spiral outward).
-// Early exit: Stops expanding when the closest possible point in the next ring
-//   (at Euclidean distance >= (r-1)*cell_size) is farther than the current
-//   k-th nearest neighbor distance AND k neighbors have been found.
-// Worst-case rings: r_max = max(grid_w, grid_h). For well-distributed 2D data,
-//   average rings visited is ~1-3 for k = log2(n).
-// Expected speedup: O(k) average vs O(n) worst-case of the old square scan.
-//   Early exit eliminates redundant cell visits; ring-only iteration avoids
-//   re-scanning interior cells.
+// Visits hash grid cells ring-by-ring in order of increasing Chebyshev
+// distance from the query cell (expanding outward).
+//
+// Early exit: Stops expanding when the closest possible point in the next
+// ring (at Euclidean distance >= (r-1)*cell_size) is farther than the
+// current k-th nearest neighbor distance AND k neighbors have been found.
+//
+// Expected behavior: ~1-3 rings visited on average for k = log2(n) with
+// well-distributed 2D data. Falls back to full scan via knnFallbackKernel
+// for degenerate distributions.
 // -----------------------------------------------------------------------
 __launch_bounds__(256, 2)
 __global__ void knnSpiralSearchKernel(
@@ -481,7 +423,7 @@ __global__ void knnSpiralSearchKernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    // --- Step 1: Initialize k-NN sorted array in registers ---
+    // Initialize k-NN sorted array in registers
     float heap_dist[MAX_K];
     int   heap_idx[MAX_K];
     int   found = 0;
@@ -504,7 +446,7 @@ __global__ void knnSpiralSearchKernel(
     if (cx < 0) cx = 0; if (cx >= grid_w) cx = grid_w - 1;
     if (cy < 0) cy = 0; if (cy >= grid_h) cy = grid_h - 1;
 
-    // --- Step 2: Spiral ring expansion ---
+    // Spiral ring expansion
     for (int r = 0; r <= r_max; r++) {
         // Early exit: closest possible point in ring r is at distance (r-1)*cell_size
         float min_possible_dist = (r <= 1) ? 0.0f : (float)(r - 1) * cell_size;
@@ -687,7 +629,7 @@ __global__ void knnSpiralSearchKernel(
 
     } // end ring loop
 
-    // --- Step 3: Write results ---
+    // Write results
     for (int t = 0; t < kk; t++) {
         d_knn_indices[i * kk + t] = (t < found) ? heap_idx[t] : -1;
         d_knn_dists[i * kk + t]   = (t < found) ? (double)heap_dist[t] : (double)FLT_MAX;
@@ -695,7 +637,8 @@ __global__ void knnSpiralSearchKernel(
 }
 
 // -----------------------------------------------------------------------
-// MODIFIED: v4.1 — Extract cheapest cross-component neighbor from k-NN list
+// Extract cheapest cross-component neighbor from k-NN list.
+// Called after knnSpiralSearchKernel to filter out same-component neighbors.
 // -----------------------------------------------------------------------
 __global__ void extractCheapestFromKNN(
     const int* __restrict__ d_knn_indices,
@@ -728,8 +671,9 @@ __global__ void extractCheapestFromKNN(
 }
 
 // -----------------------------------------------------------------------
-// MODIFIED: v4.1 — Fallback kernel: full O(n) linear scan for points that
-// failed to find enough neighbors via spiral search (degenerate distributions)
+// Fallback kernel: full O(n) linear scan for points that failed to find
+// any cross-component neighbor via spiral search (degenerate distributions).
+// Only runs for points where knn_indices[i*k] == -1.
 // -----------------------------------------------------------------------
 __global__ void knnFallbackKernel(
     const double* __restrict__ d_x,
@@ -737,13 +681,13 @@ __global__ void knnFallbackKernel(
     const int* __restrict__ d_component,
     int*   d_cheapest_to,
     double* d_cheapest_w,
-    const int* __restrict__ d_knn_indices,  // to check which points need fallback
+    const int* __restrict__ d_knn_indices,
     int k, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    // Only run for points that found no valid neighbor (knn_indices[i*k] == -1)
+    // Only run for points that found no valid neighbor
     if (d_knn_indices[i * k] != -1) return;
 
     double best_w = DBL_MAX;
@@ -765,14 +709,14 @@ __global__ void knnFallbackKernel(
     d_cheapest_w[i]  = (best_v < 0) ? (double)FLT_MAX : best_w;
 }
 
-// MODIFIED: v4 — Thrust functor to extract weight from cheapest edge results
+// Thrust functor to extract weight from cheapest edge results
 struct ExtractWeight {
     const double* weights;
     __host__ __device__ ExtractWeight(const double* w) : weights(w) {}
     __host__ __device__ double operator()(int idx) const { return weights[idx]; }
 };
 
-// MODIFIED: v4 — Check if any point failed to find a cross-component neighbor
+// Check if any point failed to find a cross-component neighbor (weight == FLT_MAX)
 bool checkMissedEdges(double* d_cheapest_w, int n) {
     thrust::device_ptr<double> w_ptr(d_cheapest_w);
     double max_w = thrust::reduce(w_ptr, w_ptr + n, (double)(-FLT_MAX), thrust::maximum<double>());
@@ -780,8 +724,17 @@ bool checkMissedEdges(double* d_cheapest_w, int n) {
 }
 
 // -----------------------------------------------------------------------
-// MODIFIED: v3.1 + v4 — BoruvkaMST with GPU merge + GPU CSR construction
-//                        + spatial hash grid KNN acceleration
+// BoruvkaMST — builds MST on GPU and outputs device-resident CSR arrays.
+//
+// Algorithm:
+//   1. Build spatial hash grid from (x, y) coordinates.
+//   2. First Borůvka iteration: use KNN candidates from spiral search.
+//   3. Remaining iterations: full O(n²) scan (components are large, KNN
+//      may miss cross-component edges efficiently).
+//   4. Merge using GPU Union-Find with per-component best-edge reduction.
+//   5. Construct CSR adjacency on GPU via Thrust exclusive scan + scatter.
+//
+// Outputs d_csr_row and d_csr_col (device pointers) — freed by caller.
 // -----------------------------------------------------------------------
 void BoruvkaMST(const VRP& vrp, int N,
                 int*& d_csr_row, int*& d_csr_col, int& mst_nnz) {
@@ -799,54 +752,53 @@ void BoruvkaMST(const VRP& vrp, int N,
   int    *d_cheapest_to;
   double *d_cheapest_w;
 
-  CUDA_CHECK(100, cudaMalloc(&d_x,            N * sizeof(double)));
-  CUDA_CHECK(101, cudaMalloc(&d_y,            N * sizeof(double)));
-  CUDA_CHECK(102, cudaMalloc(&d_comp,         N * sizeof(int)));
-  CUDA_CHECK(103, cudaMalloc(&d_cheapest_to,  N * sizeof(int)));
-  CUDA_CHECK(104, cudaMalloc(&d_cheapest_w,   N * sizeof(double)));
+  CUDA_CHECK(755, cudaMalloc(&d_x,            N * sizeof(double)));
+  CUDA_CHECK(756, cudaMalloc(&d_y,            N * sizeof(double)));
+  CUDA_CHECK(757, cudaMalloc(&d_comp,         N * sizeof(int)));
+  CUDA_CHECK(758, cudaMalloc(&d_cheapest_to,  N * sizeof(int)));
+  CUDA_CHECK(759, cudaMalloc(&d_cheapest_w,   N * sizeof(double)));
 
-  CUDA_CHECK(105, cudaMemcpy(d_x, h_x.data(), N*sizeof(double), cudaMemcpyHostToDevice));
-  CUDA_CHECK(106, cudaMemcpy(d_y, h_y.data(), N*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(761, cudaMemcpy(d_x, h_x.data(), N*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(762, cudaMemcpy(d_y, h_y.data(), N*sizeof(double), cudaMemcpyHostToDevice));
 
-  // MODIFIED: v3.1 — GPU Union-Find arrays
+  // GPU Union-Find arrays
   int *d_parent, *d_rank_uf;
-  CUDA_CHECK(107, cudaMalloc(&d_parent,  N * sizeof(int)));
-  CUDA_CHECK(108, cudaMalloc(&d_rank_uf, N * sizeof(int)));
+  CUDA_CHECK(766, cudaMalloc(&d_parent,  N * sizeof(int)));
+  CUDA_CHECK(767, cudaMalloc(&d_rank_uf, N * sizeof(int)));
 
   // MST edge accumulator arrays (max N-1 edges across all phases)
   int *d_mst_u, *d_mst_v;
   double *d_mst_w;
   int *d_mst_count;  // atomic counter on device
-  CUDA_CHECK(109, cudaMalloc(&d_mst_u,     (N - 1) * sizeof(int)));
-  CUDA_CHECK(110, cudaMalloc(&d_mst_v,     (N - 1) * sizeof(int)));
-  CUDA_CHECK(111, cudaMalloc(&d_mst_w,     (N - 1) * sizeof(double)));
-  CUDA_CHECK(112, cudaMalloc(&d_mst_count, sizeof(int)));
-  CUDA_CHECK(113, cudaMemset(d_mst_count, 0, sizeof(int)));
+  CUDA_CHECK(773, cudaMalloc(&d_mst_u,     (N - 1) * sizeof(int)));
+  CUDA_CHECK(774, cudaMalloc(&d_mst_v,     (N - 1) * sizeof(int)));
+  CUDA_CHECK(775, cudaMalloc(&d_mst_w,     (N - 1) * sizeof(double)));
+  CUDA_CHECK(776, cudaMalloc(&d_mst_count, sizeof(int)));
+  CUDA_CHECK(777, cudaMemset(d_mst_count, 0, sizeof(int)));
 
   // Per-component best-edge array (packed weight+index)
   unsigned long long *d_comp_best;
-  CUDA_CHECK(114, cudaMalloc(&d_comp_best, N * sizeof(unsigned long long)));
+  CUDA_CHECK(781, cudaMalloc(&d_comp_best, N * sizeof(unsigned long long)));
 
   const int BLK_BORUVKA = 128;
   const int GRD_BORUVKA = (N + BLK_BORUVKA - 1) / BLK_BORUVKA;
 
   // Initialize UF: parent[i]=i, rank_uf[i]=0
   initUFKernel<<<GRD_BORUVKA, BLK_BORUVKA>>>(d_parent, d_rank_uf, N);
-  CUDA_CHECK(115, cudaGetLastError());
-  CUDA_CHECK(116, cudaDeviceSynchronize());
+  CUDA_CHECK(788, cudaGetLastError());
+  CUDA_CHECK(789, cudaDeviceSynchronize());
 
   // Initialize d_comp[i] = i
-  CUDA_CHECK(117, cudaMemcpy(d_comp, d_parent, N * sizeof(int), cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(792, cudaMemcpy(d_comp, d_parent, N * sizeof(int), cudaMemcpyDeviceToDevice));
 
   // ======================================================================
-  // MODIFIED: v4 — Step 1: Compute k and cell size on host before Borůvka loop
+  // Step 1: Compute k and cell size
+  // k = number of nearest neighbors per point used in the first iteration.
+  // cell_size is chosen so that a single cell contains ~k points on average.
   // ======================================================================
-  // int k = max(8, (int)sqrtf((float)N));
   int k = max(8, (int)log2f((float)N));
-  // k is the number of nearest neighbors per point used in iteration 1
-  // minimum clamped to 8 to avoid degenerate cases for very small n
 
-  // MODIFIED: v4 — Compute bounding box using Thrust reductions on device
+  // Compute bounding box using Thrust reductions on device
   float x_min, x_max, y_min, y_max;
   {
     thrust::device_ptr<double> dx_ptr(d_x);
@@ -857,45 +809,44 @@ void BoruvkaMST(const VRP& vrp, int N,
     y_max = (float)*thrust::max_element(dy_ptr, dy_ptr + N);
   }
 
-  // MODIFIED: v4 — Compute cell size from average point spacing
+  // Compute cell size from average point spacing
   float bbox_area = (x_max - x_min) * (y_max - y_min);
   float avg_spacing = sqrtf(bbox_area / (float)N);
   float cell_size = avg_spacing * sqrtf((float)k);
-  // cell_size is chosen so that a single cell contains approximately k points on average
 
   // Guard against degenerate cell_size (all points collinear or coincident)
   if (cell_size < 1e-6f) cell_size = 1.0f;
 
-  // MODIFIED: v4 — Compute grid dimensions
+  // Compute grid dimensions
   int grid_w = (int)ceilf((x_max - x_min) / cell_size) + 1;
   int grid_h = (int)ceilf((y_max - y_min) / cell_size) + 1;
   int num_cells = grid_w * grid_h;
 
-  if (g_verbose) std::cerr << "v4 hash grid: k=" << k
+  if (g_verbose) std::cerr << "Hash grid: k=" << k
             << " cell_size=" << cell_size
             << " grid=" << grid_w << "x" << grid_h
             << " num_cells=" << num_cells << "\n";
 
   // ======================================================================
-  // MODIFIED: v4 — Step 2: Build spatial hash grid on GPU
+  // Step 2: Build spatial hash grid on GPU
   // ======================================================================
   int* d_cell_ids;
   int* d_point_ids;
   int* d_cell_start;
   int* d_cell_end;
 
-  CUDA_CHECK(200, cudaMalloc(&d_cell_ids,   N * sizeof(int)));
-  CUDA_CHECK(201, cudaMalloc(&d_point_ids,  N * sizeof(int)));
-  CUDA_CHECK(202, cudaMalloc(&d_cell_start, num_cells * sizeof(int)));
-  CUDA_CHECK(203, cudaMalloc(&d_cell_end,   num_cells * sizeof(int)));
+  CUDA_CHECK(838, cudaMalloc(&d_cell_ids,   N * sizeof(int)));
+  CUDA_CHECK(839, cudaMalloc(&d_point_ids,  N * sizeof(int)));
+  CUDA_CHECK(840, cudaMalloc(&d_cell_start, num_cells * sizeof(int)));
+  CUDA_CHECK(841, cudaMalloc(&d_cell_end,   num_cells * sizeof(int)));
 
   // Kernel 1 — Assign each point to a cell
   assignCellsKernel<<<GRD_BORUVKA, BLK_BORUVKA>>>(
       d_x, d_y, d_cell_ids, d_point_ids,
       x_min, y_min, cell_size, grid_w, grid_h, N
   );
-  CUDA_CHECK(204, cudaGetLastError());
-  CUDA_CHECK(205, cudaDeviceSynchronize());
+  CUDA_CHECK(848, cudaGetLastError());
+  CUDA_CHECK(849, cudaDeviceSynchronize());
 
   // Sort points by cell using Thrust
   {
@@ -905,19 +856,19 @@ void BoruvkaMST(const VRP& vrp, int N,
   }
 
   // Kernel 2 — Find start and end of each cell in the sorted array
-  CUDA_CHECK(206, cudaMemset(d_cell_start, -1, num_cells * sizeof(int)));
-  CUDA_CHECK(207, cudaMemset(d_cell_end,   -1, num_cells * sizeof(int)));
+  CUDA_CHECK(859, cudaMemset(d_cell_start, -1, num_cells * sizeof(int)));
+  CUDA_CHECK(860, cudaMemset(d_cell_end,   -1, num_cells * sizeof(int)));
 
   findCellBoundsKernel<<<GRD_BORUVKA, BLK_BORUVKA>>>(
       d_cell_ids, d_cell_start, d_cell_end, N
   );
-  CUDA_CHECK(208, cudaGetLastError());
-  CUDA_CHECK(209, cudaDeviceSynchronize());
+  CUDA_CHECK(865, cudaGetLastError());
+  CUDA_CHECK(866, cudaDeviceSynchronize());
 
-  if (g_verbose) std::cerr << "v4: Spatial hash grid built.\n";
+  if (g_verbose) std::cerr << "Spatial hash grid built.\n";
 
   // ======================================================================
-  // MODIFIED: v4.1 — Step 4: Borůvka loop with spiral search KNN
+  // Step 3: Borůvka main loop with spiral search KNN (first iteration only)
   // ======================================================================
   int phase = 0;
   int h_mst_count = 0;
@@ -926,15 +877,15 @@ void BoruvkaMST(const VRP& vrp, int N,
   int boruvka_iter = 0;
   int r_max = max(grid_w, grid_h);  // maximum possible ring radius
 
-  // MODIFIED: v4.1 — Allocate KNN output buffers
+  // Allocate KNN output buffers
   int* d_knn_indices = nullptr;
   double* d_knn_dists = nullptr;
   if (use_knn) {
-    CUDA_CHECK(300, cudaMalloc(&d_knn_indices, (size_t)N * k * sizeof(int)));
-    CUDA_CHECK(301, cudaMalloc(&d_knn_dists,   (size_t)N * k * sizeof(double)));
+    CUDA_CHECK(884, cudaMalloc(&d_knn_indices, (size_t)N * k * sizeof(int)));
+    CUDA_CHECK(885, cudaMalloc(&d_knn_dists,   (size_t)N * k * sizeof(double)));
   }
 
-  // MODIFIED: v4.1 — Timing events for spiral search kernel
+  // Timing events for spiral search kernel
   cudaEvent_t knn_start_evt, knn_stop_evt;
   cudaEventCreate(&knn_start_evt);
   cudaEventCreate(&knn_stop_evt);
@@ -948,11 +899,9 @@ void BoruvkaMST(const VRP& vrp, int N,
   while (h_mst_count < N - 1) {
     phase++;
 
-    // MODIFIED: v4.1 — Choose between spiral search KNN and full O(n²) scan
+    // Choose between spiral search KNN and full O(n²) scan
     if (use_knn) {
-        // --- Launch spiral search KNN kernel with timing ---
-        // cudaEventRecord(knn_start_evt);
-
+        // Launch spiral search KNN kernel
         knnSpiralSearchKernel<<<GRD_SPIRAL, BLK_SPIRAL>>>(
             d_x, d_y,
             d_point_ids, d_cell_start, d_cell_end,
@@ -961,7 +910,7 @@ void BoruvkaMST(const VRP& vrp, int N,
             grid_w, grid_h,
             k, r_max, N
         );
-        CUDA_CHECK(120, cudaGetLastError());
+        CUDA_CHECK(913, cudaGetLastError());
 
         // Extract cheapest cross-component neighbor from k-NN list
         extractCheapestFromKNN<<<GRD_BORUVKA, BLK_BORUVKA>>>(
@@ -969,18 +918,9 @@ void BoruvkaMST(const VRP& vrp, int N,
             d_cheapest_to, d_cheapest_w,
             k, N
         );
-        CUDA_CHECK(121, cudaGetLastError());
+        CUDA_CHECK(921, cudaGetLastError());
 
-        // cudaEventRecord(knn_stop_evt);
-        // cudaEventSynchronize(knn_stop_evt);
-        // float knn_ms = 0.0f;
-        // cudaEventElapsedTime(&knn_ms, knn_start_evt, knn_stop_evt);
-        // knn_total_ms += knn_ms;
-
-        // if (g_verbose) std::cerr << "v4.1: Spiral KNN phase " << phase
-        //           << " took " << knn_ms << " ms\n";
-
-        // --- Validation: fallback for points with no valid neighbor ---
+        // Validation: fallback for points with no valid neighbor
         bool any_missed = checkMissedEdges(d_cheapest_w, N);
         if (any_missed) {
             // Launch fallback kernel for degenerate points
@@ -990,50 +930,49 @@ void BoruvkaMST(const VRP& vrp, int N,
                 d_knn_indices,
                 k, N
             );
-            CUDA_CHECK(122, cudaGetLastError());
-            CUDA_CHECK(123, cudaDeviceSynchronize());
-            if (g_verbose) std::cerr << "v4.1: Fallback kernel launched for missed edges\n";
+            CUDA_CHECK(933, cudaGetLastError());
+            CUDA_CHECK(934, cudaDeviceSynchronize());
+            if (g_verbose) std::cerr << "Fallback kernel launched for missed edges\n";
         }
 
         // After first KNN iteration, switch to full scan for remaining iterations
-        // (components are larger, KNN may not find cross-component edges efficiently)
         use_knn = false;
 
     } else {
-        // Use original full O(n²) scan kernel from gpuMDS-v3.1.cu
+        // Use full O(n²) scan kernel
         boruvkaFindCheapest<<<GRD_BORUVKA, BLK_BORUVKA>>>(
             d_x, d_y, d_comp,
             d_cheapest_to, d_cheapest_w,
             N);
-        CUDA_CHECK(120, cudaGetLastError());
-        CUDA_CHECK(121, cudaDeviceSynchronize());
+        CUDA_CHECK(947, cudaGetLastError());
+        CUDA_CHECK(948, cudaDeviceSynchronize());
     }
     boruvka_iter++;
 
-    // MODIFIED: v3.1 — Per-component best-edge reduction
-    CUDA_CHECK(122, cudaMemset(d_comp_best, 0xFF, N * sizeof(unsigned long long)));
+    // Per-component best-edge reduction
+    CUDA_CHECK(953, cudaMemset(d_comp_best, 0xFF, N * sizeof(unsigned long long)));
     findCompBestKernel<<<GRD_BORUVKA, BLK_BORUVKA>>>(
         d_comp, d_cheapest_to, d_cheapest_w, d_comp_best, N);
-    CUDA_CHECK(123, cudaGetLastError());
-    CUDA_CHECK(124, cudaDeviceSynchronize());
+    CUDA_CHECK(956, cudaGetLastError());
+    CUDA_CHECK(957, cudaDeviceSynchronize());
 
-    // MODIFIED: v3.1 — Only merge per-component best edges
+    // Only merge per-component best edges
     int prev_count = h_mst_count;
     mergeComponentsKernel<<<GRD_BORUVKA, BLK_BORUVKA>>>(
         d_parent, d_rank_uf, d_comp, d_cheapest_to, d_cheapest_w,
         d_comp_best,
         d_mst_u, d_mst_v, d_mst_w, d_mst_count,
         N, vrp.toRound);
-    CUDA_CHECK(125, cudaGetLastError());
-    CUDA_CHECK(126, cudaDeviceSynchronize());
+    CUDA_CHECK(966, cudaGetLastError());
+    CUDA_CHECK(967, cudaDeviceSynchronize());
 
     // Update component labels from parent array
     updateComponentsKernel<<<GRD_BORUVKA, BLK_BORUVKA>>>(d_comp, d_parent, N);
-    CUDA_CHECK(125, cudaGetLastError());
-    CUDA_CHECK(126, cudaDeviceSynchronize());
+    CUDA_CHECK(971, cudaGetLastError());
+    CUDA_CHECK(972, cudaDeviceSynchronize());
 
     // Read current MST edge count from device
-    CUDA_CHECK(124, cudaMemcpy(&h_mst_count, d_mst_count, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(975, cudaMemcpy(&h_mst_count, d_mst_count, sizeof(int), cudaMemcpyDeviceToHost));
 
     if (g_verbose) std::cerr << "Borůvka phase " << phase
               << ": MST edges so far = " << h_mst_count
@@ -1050,17 +989,18 @@ void BoruvkaMST(const VRP& vrp, int N,
             << " edges in " << phase << " phases ("
             << boruvka_iter << " iterations).\n";
 
-  // MODIFIED: v4.1 — Print KNN spiral search total time
-  if (g_verbose) std::cerr << "v4.1: Spiral search KNN total time: " << knn_total_ms << " ms\n";
+  if (g_verbose) std::cerr << "Spiral search KNN total time: " << knn_total_ms << " ms\n";
 
-  // MODIFIED: v4.1 — Free KNN buffers and timing events
-  if (d_knn_indices) { CUDA_CHECK(310, cudaFree(d_knn_indices)); d_knn_indices = nullptr; }
-  if (d_knn_dists)   { CUDA_CHECK(311, cudaFree(d_knn_dists));   d_knn_dists = nullptr; }
+  // Free KNN buffers and timing events
+  if (d_knn_indices) { CUDA_CHECK(995, cudaFree(d_knn_indices)); d_knn_indices = nullptr; }
+  if (d_knn_dists)   { CUDA_CHECK(996, cudaFree(d_knn_dists));   d_knn_dists = nullptr; }
   cudaEventDestroy(knn_start_evt);
   cudaEventDestroy(knn_stop_evt);
 
   // ======================================================================
-  // MODIFIED: v4 — Step 5: Memory management for hash grid
+  // Step 4: Memory management for hash grid
+  // Free hash grid early if GPU memory headroom is insufficient for later
+  // allocations; otherwise keep alive to avoid re-allocation overhead.
   // ======================================================================
   {
     size_t free_mem, total_mem;
@@ -1072,8 +1012,7 @@ void BoruvkaMST(const VRP& vrp, int N,
                           + (size_t)num_cells * sizeof(int);  // d_cell_end
 
     if (free_mem < hash_grid_size * 2) {
-        // Not enough headroom — free the hash grid
-        if (g_verbose) std::cerr << "v4: Freeing hash grid (low memory headroom).\n";
+        if (g_verbose) std::cerr << "Freeing hash grid (low memory headroom).\n";
         cudaFree(d_cell_ids);
         cudaFree(d_point_ids);
         cudaFree(d_cell_start);
@@ -1083,34 +1022,37 @@ void BoruvkaMST(const VRP& vrp, int N,
         d_cell_start = nullptr;
         d_cell_end = nullptr;
     } else {
-        if (g_verbose) std::cerr << "v4: Keeping hash grid alive (sufficient memory).\n";
+        if (g_verbose) std::cerr << "Keeping hash grid alive (sufficient memory).\n";
     }
   }
 
   // ======================================================================
-  // MODIFIED: v3.1 — GPU-resident CSR construction from accumulated edges
+  // Step 5: GPU-resident CSR construction from accumulated MST edges
+  //   1. Count degrees per node.
+  //   2. Exclusive scan to build row pointer array.
+  //   3. Scatter edges into col_idx and weights arrays.
   // ======================================================================
   int num_mst_edges = h_mst_count;
   mst_nnz = 2 * num_mst_edges;  // each MST edge appears twice (bidirectional)
 
   // Allocate CSR arrays on device
   int* d_degree;
-  CUDA_CHECK(140, cudaMalloc(&d_degree,   N * sizeof(int)));
-  CUDA_CHECK(141, cudaMemset(d_degree, 0, N * sizeof(int)));
-  CUDA_CHECK(142, cudaMalloc(&d_csr_row, (N + 1) * sizeof(int)));
-  CUDA_CHECK(143, cudaMalloc(&d_csr_col,  mst_nnz * sizeof(int)));
+  CUDA_CHECK(1040, cudaMalloc(&d_degree,   N * sizeof(int)));
+  CUDA_CHECK(1041, cudaMemset(d_degree, 0, N * sizeof(int)));
+  CUDA_CHECK(1042, cudaMalloc(&d_csr_row, (N + 1) * sizeof(int)));
+  CUDA_CHECK(1043, cudaMalloc(&d_csr_col,  mst_nnz * sizeof(int)));
 
   // Also build weights on device (double to match weight_t)
   double* d_csr_weights;
-  CUDA_CHECK(144, cudaMalloc(&d_csr_weights, mst_nnz * sizeof(double)));
+  CUDA_CHECK(1047, cudaMalloc(&d_csr_weights, mst_nnz * sizeof(double)));
 
   // Step 1 — degree counting kernel
   int grd_sel = (num_mst_edges + BLK_BORUVKA - 1) / BLK_BORUVKA;
   if (grd_sel == 0) grd_sel = 1;  // guard against zero-edge case
   countDegreesKernel<<<grd_sel, BLK_BORUVKA>>>(
       d_mst_u, d_mst_v, d_degree, num_mst_edges);
-  CUDA_CHECK(145, cudaGetLastError());
-  CUDA_CHECK(146, cudaDeviceSynchronize());
+  CUDA_CHECK(1054, cudaGetLastError());
+  CUDA_CHECK(1055, cudaDeviceSynchronize());
 
   // Step 2 — build row pointer via Thrust exclusive scan
   {
@@ -1119,37 +1061,37 @@ void BoruvkaMST(const VRP& vrp, int N,
     thrust::exclusive_scan(deg_ptr, deg_ptr + N, row_ptr, 0);
   }
   // Write final value: csr_row_ptr[N] = mst_nnz
-  CUDA_CHECK(147, cudaMemcpy(d_csr_row + N, &mst_nnz, sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(1064, cudaMemcpy(d_csr_row + N, &mst_nnz, sizeof(int), cudaMemcpyHostToDevice));
 
   // Step 3 — scatter kernel to fill col_idx and weights
   int* d_cursor;
-  CUDA_CHECK(148, cudaMalloc(&d_cursor, N * sizeof(int)));
-  CUDA_CHECK(149, cudaMemcpy(d_cursor, d_csr_row, N * sizeof(int), cudaMemcpyDeviceToDevice));
+  CUDA_CHECK(1068, cudaMalloc(&d_cursor, N * sizeof(int)));
+  CUDA_CHECK(1069, cudaMemcpy(d_cursor, d_csr_row, N * sizeof(int), cudaMemcpyDeviceToDevice));
 
   scatterEdgesKernel<<<grd_sel, BLK_BORUVKA>>>(
       d_mst_u, d_mst_v, d_mst_w,
       d_cursor, d_csr_col, d_csr_weights,
       num_mst_edges);
-  CUDA_CHECK(150, cudaGetLastError());
-  CUDA_CHECK(151, cudaDeviceSynchronize());
+  CUDA_CHECK(1075, cudaGetLastError());
+  CUDA_CHECK(1076, cudaDeviceSynchronize());
 
   // ---- CLEANUP temporary GPU buffers ----
-  CUDA_CHECK(160, cudaFree(d_cursor));
-  CUDA_CHECK(161, cudaFree(d_degree));
-  CUDA_CHECK(162, cudaFree(d_mst_u));
-  CUDA_CHECK(163, cudaFree(d_mst_v));
-  CUDA_CHECK(164, cudaFree(d_mst_w));
-  CUDA_CHECK(165, cudaFree(d_mst_count));
-  CUDA_CHECK(166, cudaFree(d_parent));
-  CUDA_CHECK(167, cudaFree(d_rank_uf));
-  CUDA_CHECK(168, cudaFree(d_comp_best));
-  CUDA_CHECK(169, cudaFree(d_x));
-  CUDA_CHECK(170, cudaFree(d_y));
-  CUDA_CHECK(171, cudaFree(d_comp));
-  CUDA_CHECK(172, cudaFree(d_cheapest_to));
-  CUDA_CHECK(173, cudaFree(d_cheapest_w));
-  CUDA_CHECK(174, cudaFree(d_csr_weights));  // not used by Part 2
-  // MODIFIED: v4 — Free hash grid arrays if they were not already freed
+  CUDA_CHECK(1079, cudaFree(d_cursor));
+  CUDA_CHECK(1080, cudaFree(d_degree));
+  CUDA_CHECK(1081, cudaFree(d_mst_u));
+  CUDA_CHECK(1082, cudaFree(d_mst_v));
+  CUDA_CHECK(1083, cudaFree(d_mst_w));
+  CUDA_CHECK(1084, cudaFree(d_mst_count));
+  CUDA_CHECK(1085, cudaFree(d_parent));
+  CUDA_CHECK(1086, cudaFree(d_rank_uf));
+  CUDA_CHECK(1087, cudaFree(d_comp_best));
+  CUDA_CHECK(1088, cudaFree(d_x));
+  CUDA_CHECK(1089, cudaFree(d_y));
+  CUDA_CHECK(1090, cudaFree(d_comp));
+  CUDA_CHECK(1091, cudaFree(d_cheapest_to));
+  CUDA_CHECK(1092, cudaFree(d_cheapest_w));
+  CUDA_CHECK(1093, cudaFree(d_csr_weights));  // not used by Part 2
+  // Free hash grid arrays if they were not already freed
   if (d_cell_ids)   cudaFree(d_cell_ids);
   if (d_point_ids)  cudaFree(d_point_ids);
   if (d_cell_start) cudaFree(d_cell_start);
@@ -1158,7 +1100,7 @@ void BoruvkaMST(const VRP& vrp, int N,
 }
 
 // =========================================================================
-//  PART 2: 100k LOOP — One CUDA thread per iteration  (same as gpuMDS.cu)
+//  PART 2: 1k Route Search Loop — One CUDA thread per iteration
 // =========================================================================
 
 // On-the-fly Euclidean distance
@@ -1178,8 +1120,9 @@ __global__ void initRNG(curandState* states, unsigned long long seed, int n) {
 }
 
 // -----------------------------------------------------------------------
-// 100k kernel: one thread per iteration
-// Each thread: shuffle MST neighbors, iterative DFS, compute cost
+// Route search kernel: one thread per iteration.
+// Each thread: shuffle MST neighbors, iterative DFS, compute CVRP cost.
+// Per-thread buffers are laid out in column-major order for memory coalescing.
 // -----------------------------------------------------------------------
 __global__ void routeSearchKernelV2(
     const double* __restrict__ x,
@@ -1277,7 +1220,7 @@ __global__ void routeSearchKernelV2(
 }
 
 // =========================================================================
-//  PART 3: Post-processing — CPU (identical to seqMDS)
+//  PART 3: Post-processing — CPU
 // =========================================================================
 
 std::vector<std::vector<node_t>>
@@ -1316,7 +1259,7 @@ weight_t totalCost(const VRP& vrp,
   return c;
 }
 
-// 2-opt (identical to seqMDS)
+// 2-opt local search for a single route
 void tsp_2opt(const VRP& vrp, std::vector<node_t>& cities) {
   unsigned sz = (unsigned)cities.size();
   if (sz <= 2) return;
@@ -1338,7 +1281,7 @@ void tsp_2opt(const VRP& vrp, std::vector<node_t>& cities) {
   }
 }
 
-// tsp_approx (identical to seqMDS)
+// Nearest-neighbor greedy tour construction for a single route
 void tsp_approx(const VRP& vrp, std::vector<node_t>& cities,
                 std::vector<node_t>& tour, int ncities) {
   for (int i = 1; i < ncities; i++) tour[i] = cities[i-1];
@@ -1388,6 +1331,7 @@ postprocess_2OPT(const VRP& vrp,
   return out;
 }
 
+// Apply both nearest-neighbor and 2-opt post-processing, keep the better result per route.
 std::vector<std::vector<node_t>>
 postProcessIt(const VRP& vrp,
               std::vector<std::vector<node_t>>& minRoute,
@@ -1435,7 +1379,7 @@ void printOutput(const VRP& vrp,
 // =========================================================================
 int main(int argc, char* argv[]) {
   if (argc < 2) {
-    std::cerr << "gpuMDS-v4\nUsage: " << argv[0]
+    std::cerr << "gpuMDS\nUsage: " << argv[0]
               << " input.vrp [-round 0|1] [-v]\n";
     return 1;
   }
@@ -1457,10 +1401,9 @@ int main(int argc, char* argv[]) {
   auto t_start = std::chrono::high_resolution_clock::now();
 
   // ------------------------------------------------------------------
-  // PART 1: Borůvka's MST on GPU (replaces Prim's from gpuMDS-v2.cu)
+  // PART 1: Borůvka's MST on GPU
+  // Outputs device CSR pointers directly (freed after Part 2).
   // ------------------------------------------------------------------
-
-  // MODIFIED: v3.1 — BoruvkaMST now outputs device CSR pointers directly
   int *d_csr_row, *d_csr_col;
   int mst_nnz;
   BoruvkaMST(vrp, N, d_csr_row, d_csr_col, mst_nnz);
@@ -1471,7 +1414,7 @@ int main(int argc, char* argv[]) {
   if (g_verbose) std::cerr << "Part 1 (MST) time: " << time_mst << " s\n";
 
   // ------------------------------------------------------------------
-  // PART 2: 100k loop on GPU
+  // PART 2: 1k route search loop on GPU
   // ------------------------------------------------------------------
 
   // Copy node data to GPU
@@ -1483,12 +1426,12 @@ int main(int argc, char* argv[]) {
   }
 
   double *d_x, *d_y, *d_demand;
-  CUDA_CHECK(1, cudaMalloc(&d_x,      N * sizeof(double)));
-  CUDA_CHECK(2, cudaMalloc(&d_y,      N * sizeof(double)));
-  CUDA_CHECK(3, cudaMalloc(&d_demand, N * sizeof(double)));
-  CUDA_CHECK(4, cudaMemcpy(d_x,      hx.data(), N*sizeof(double), cudaMemcpyHostToDevice));
-  CUDA_CHECK(5, cudaMemcpy(d_y,      hy.data(), N*sizeof(double), cudaMemcpyHostToDevice));
-  CUDA_CHECK(6, cudaMemcpy(d_demand, hd.data(), N*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(1429, cudaMalloc(&d_x,      N * sizeof(double)));
+  CUDA_CHECK(1430, cudaMalloc(&d_y,      N * sizeof(double)));
+  CUDA_CHECK(1431, cudaMalloc(&d_demand, N * sizeof(double)));
+  CUDA_CHECK(1432, cudaMemcpy(d_x,      hx.data(), N*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(1433, cudaMemcpy(d_y,      hy.data(), N*sizeof(double), cudaMemcpyHostToDevice));
+  CUDA_CHECK(1434, cudaMemcpy(d_demand, hd.data(), N*sizeof(double), cudaMemcpyHostToDevice));
 
   const int N_ITER = 1000;
   const int BLK    = 16;
@@ -1496,7 +1439,7 @@ int main(int argc, char* argv[]) {
 
   // Per-thread cost array
   double* d_costs;
-  CUDA_CHECK(11, cudaMalloc(&d_costs, N_ITER * sizeof(double)));
+  CUDA_CHECK(1442, cudaMalloc(&d_costs, N_ITER * sizeof(double)));
 
   // Per-thread scratchpad buffers
   long long buf_adj_sz  = (long long)N_ITER * mst_nnz;
@@ -1516,11 +1459,11 @@ int main(int argc, char* argv[]) {
 
   int*  d_buf_adj,  *d_buf_ptr, *d_buf_stk, *d_buf_tour;
   bool* d_buf_vis;
-  CUDA_CHECK(12, cudaMalloc(&d_buf_adj,  buf_adj_sz  * sizeof(int)));
-  CUDA_CHECK(13, cudaMalloc(&d_buf_ptr,  buf_ptr_sz  * sizeof(int)));
-  CUDA_CHECK(14, cudaMalloc(&d_buf_stk,  buf_stk_sz  * sizeof(int)));
-  CUDA_CHECK(15, cudaMalloc(&d_buf_vis,  buf_vis_sz  * sizeof(bool)));
-  CUDA_CHECK(16, cudaMalloc(&d_buf_tour, buf_tour_sz * sizeof(int)));
+  CUDA_CHECK(1462, cudaMalloc(&d_buf_adj,  buf_adj_sz  * sizeof(int)));
+  CUDA_CHECK(1463, cudaMalloc(&d_buf_ptr,  buf_ptr_sz  * sizeof(int)));
+  CUDA_CHECK(1464, cudaMalloc(&d_buf_stk,  buf_stk_sz  * sizeof(int)));
+  CUDA_CHECK(1465, cudaMalloc(&d_buf_vis,  buf_vis_sz  * sizeof(bool)));
+  CUDA_CHECK(1466, cudaMalloc(&d_buf_tour, buf_tour_sz * sizeof(int)));
 
   if (g_verbose) std::cerr << "Launching 1k route search kernel...\n";
 
@@ -1529,25 +1472,25 @@ int main(int argc, char* argv[]) {
       d_csr_row, d_csr_col, d_costs, (unsigned long long)time(nullptr),
       d_buf_adj, d_buf_ptr, d_buf_stk, d_buf_vis, d_buf_tour,
       N_ITER);
-  CUDA_CHECK(17, cudaGetLastError());
-  CUDA_CHECK(18, cudaDeviceSynchronize());
+  CUDA_CHECK(1475, cudaGetLastError());
+  CUDA_CHECK(1476, cudaDeviceSynchronize());
 
   // Find best thread
   thrust::device_ptr<double> dp_costs(d_costs);
   auto best_it  = thrust::min_element(thrust::device, dp_costs, dp_costs + N_ITER);
   int  best_tid = (int)(best_it - dp_costs);
   double best_cost_gpu;
-  CUDA_CHECK(19, cudaMemcpy(&best_cost_gpu, d_costs + best_tid,
+  CUDA_CHECK(1483, cudaMemcpy(&best_cost_gpu, d_costs + best_tid,
                          sizeof(double), cudaMemcpyDeviceToHost));
 
   if (g_verbose) std::cerr << "Best GPU cost: " << best_cost_gpu
             << " (thread " << best_tid << ")\n";
 
-  // Copy best tour back
+  // Copy best tour back to host
   std::vector<int> best_tour(N);
 
   for(int i=0; i<N; i++) {
-    CUDA_CHECK(20, cudaMemcpy(&best_tour[i],
+    CUDA_CHECK(1493, cudaMemcpy(&best_tour[i],
                            d_buf_tour + (long long)i * N_ITER + best_tid,
                            sizeof(int), cudaMemcpyDeviceToHost));
   }
@@ -1559,7 +1502,7 @@ int main(int argc, char* argv[]) {
   weight_t minCost = totalCost(vrp, minRoute);
 
   // ------------------------------------------------------------------
-  // PART 3: Post-processing on CPU (same as seqMDS)
+  // PART 3: Post-processing on CPU
   // ------------------------------------------------------------------
   auto postRoutes = postProcessIt(vrp, minRoute, minCost);
 
@@ -1567,8 +1510,7 @@ int main(int argc, char* argv[]) {
   double time_total = std::chrono::duration<double>(t_end - t_start).count();
 
   bool valid = verify_sol(vrp, postRoutes);
-  // MODIFIED: v4 — output file name changed to v4.txt
-  std::ofstream ofs("v4.1.txt", std::ios::app);
+  std::ofstream ofs("output.txt", std::ios::app);
   if (ofs.is_open()) {
     ofs << argv[1]
         << "\tMinCost: " << minCost
@@ -1583,13 +1525,13 @@ int main(int argc, char* argv[]) {
   // printOutput(vrp, postRoutes);
 
   // Cleanup
-  CUDA_CHECK(21, cudaFree(d_x)); CUDA_CHECK(22, cudaFree(d_y));
-  CUDA_CHECK(23, cudaFree(d_demand));
-  CUDA_CHECK(24, cudaFree(d_csr_row)); CUDA_CHECK(25, cudaFree(d_csr_col));
-  CUDA_CHECK(26, cudaFree(d_costs));
-  CUDA_CHECK(27, cudaFree(d_buf_adj)); CUDA_CHECK(28, cudaFree(d_buf_ptr));
-  CUDA_CHECK(29, cudaFree(d_buf_stk)); CUDA_CHECK(30, cudaFree(d_buf_vis));
-  CUDA_CHECK(31, cudaFree(d_buf_tour));
+  CUDA_CHECK(1528, cudaFree(d_x)); CUDA_CHECK(1528, cudaFree(d_y));
+  CUDA_CHECK(1529, cudaFree(d_demand));
+  CUDA_CHECK(1530, cudaFree(d_csr_row)); CUDA_CHECK(1530, cudaFree(d_csr_col));
+  CUDA_CHECK(1531, cudaFree(d_costs));
+  CUDA_CHECK(1532, cudaFree(d_buf_adj)); CUDA_CHECK(1532, cudaFree(d_buf_ptr));
+  CUDA_CHECK(1533, cudaFree(d_buf_stk)); CUDA_CHECK(1533, cudaFree(d_buf_vis));
+  CUDA_CHECK(1534, cudaFree(d_buf_tour));
 
   return 0;
 }
