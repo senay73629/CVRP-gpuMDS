@@ -2,6 +2,9 @@ NVCC     = nvcc
 NVCCFLAGS = -O3 -std=c++17
 LIBS      = -lcurand
 
+gpuMDS: gpuMDS.cu
+	$(NVCC) $(NVCCFLAGS) -o gpuMDS.out gpuMDS.cu $(LIBS)
+
 all: v1 v2 v3 v3.1 v4 v4.1
 
 v1: gpuMDS-v1.cu
