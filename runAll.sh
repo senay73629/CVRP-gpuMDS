@@ -45,6 +45,10 @@ fi
 echo "Compilation successful."
 echo ""
 
+if [ -z "$EXENAME" ]; then
+    EXENAME="gpuMDS"
+fi
+
 # Optional: create output directory
 # OUTDIR=out${EXENAME}$(date +%d-%b-%Y-%H%M%S)
 # mkdir -p $OUTDIR
