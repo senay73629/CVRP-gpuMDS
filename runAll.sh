@@ -9,16 +9,16 @@
 #   ./runAll.sh v3 results.txt        -> runs gpuMDS-v3, appends output to results.txt
 
 # Determine input directory based on optional 3rd argument
-INPUT_LOC=${3:-"local"}
-if [ "$INPUT_LOC" == "remote" ]; then
-    INPDIR=../parMDS-main/inputs
-else
+INPUT_LOC=${1:-"generated"}
+if [ "$INPUT_LOC" == "normal" ]; then
     INPDIR=./inputs
+else
+    INPDIR=./generated_inputs
 fi
 
 # Determine which variant to use based on optional argument
-VARIANT=${1:-""}
-OUTFILE=${2:-""}
+VARIANT=${2:-""}
+OUTFILE=${3:-""}
 
 if [ "$VARIANT" = "v1" ]; then
     EXENAME=v1
@@ -32,6 +32,8 @@ elif [ "$VARIANT" = "v4" ]; then
     EXENAME=v4
 elif [ "$VARIANT" = "v4.1" ]; then
     EXENAME=v4.1
+else
+    EXENAME=""
 fi
 
 echo "Compiling $EXENAME..."
